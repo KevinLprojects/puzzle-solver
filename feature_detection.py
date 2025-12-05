@@ -10,36 +10,48 @@ from itertools import combinations
 
 KERNEL_SIZE_PERCENT = 0.5 # percent of the sqrt of the piece size for the kernel size
 KERNEL_SIZE_PERCENT_FEATURES = 0.15 # percent of the sqrt of the piece size for the kernel size for feature erosion
-EDGE_BLUR_PERCENT = 0.1
-DERIVATIVE_PERCENT = 0.15
+DERIVATIVE_PERCENT = 0.15 # percent of sqrt of piece size points to include in a single derivative
 
+# returns the closest odd int to the given input
 def odd_size(size):
     return int(2 * np.floor(size / 2 + 1) - 1)
 
+# calculates dr/dtheta for a given point in s set of coords and a center point. n is the number of neighboring pixels to use for a given pixels derivative
 def radial_derivative(contour, center, idx, n=3):
+    # opencv contours have shape [N, 1, 2]
     contour = contour[:,0,:]
     cx, cy = center
     N = len(contour)
 
+    # find the distance of each coord in the contour from the center
     radii = np.sqrt((contour[:,0]-cx)**2 + (contour[:,1]-cy)**2)
 
     contributions = []
     weights = []
 
+    # loops through the neighboring pixels
     for k in range(1, n+1):
+        # weight according to distance from given id
         w = 1 - (k / n)
 
+        # get two consecutive neighbors from the left side
         i1 = (idx - k) % N
         i2 = (idx - (k+1)) % N
 
+        # get the coords of those points
         p1 = contour[i1]
         p2 = contour[i2]
+
+        # distance between the two points
         ds_left = np.linalg.norm(p1 - p2)
+
+        # make sure they are 2 different points, then record dr/ds and the weight
         if ds_left > 0:
             dr_left = radii[i1] - radii[i2]
             contributions.append(dr_left / ds_left)
             weights.append(w)
 
+        # do the same thing on the right side
         j1 = (idx + k) % N
         j2 = (idx + (k+1)) % N
 
@@ -51,13 +63,12 @@ def radial_derivative(contour, center, idx, n=3):
             contributions.append(dr_right / ds_right)
             weights.append(w)
 
-    if not contributions:
-        return 0.0
-
     contributions = np.array(contributions)
     weights = np.array(weights)
+    # return the weighted average of the derivative
     return float(np.sum(contributions * weights) / np.sum(weights))
 
+# find the points where a sequence crosses 0 (only from positive to negative or the convex corners)
 def find_pos_to_neg_zero_crossings(values):
     N = len(values)
     crossings = []
@@ -74,17 +85,20 @@ def find_pos_to_neg_zero_crossings(values):
 
     return crossings
 
+# get all the combos of 4 points from a given set of points for fitting a quad
 def combos_of_four(zero_crossings):
     if len(zero_crossings) < 4:
         return None
     
     return list(combinations(zero_crossings, 4))
 
+# check if two line segments intersect (I found this on the internet don't sue me)
 def segments_intersect(A, B, C, D):
     def ccw(P, Q, R):
         return (R[1] - P[1]) * (Q[0] - P[0]) > (Q[1] - P[1]) * (R[0] - P[0])
     return (ccw(A, C, D) != ccw(B, C, D)) and (ccw(A, B, C) != ccw(A, B, D))
 
+# check if a polygon self intersects (sensitive to order)
 def polygon_self_intersects(poly):
     P0, P1, P2, P3 = poly
 
@@ -95,6 +109,7 @@ def polygon_self_intersects(poly):
         (P3, P0)
     ]
 
+    # combos of edges to check (adjacent edges can't intersect for obvious reasons)
     checks = [
         (0, 2),
         (1, 3),
@@ -108,7 +123,8 @@ def polygon_self_intersects(poly):
     
     return False
 
-def first_valid_quad(contour, combo):
+# check if a combo is a valid quad
+def valid_quad(contour, combo):
     poly = np.array([contour[i][0] for i in combo], dtype=np.int32)
 
     if polygon_self_intersects(poly):
@@ -117,16 +133,22 @@ def first_valid_quad(contour, combo):
     return poly
 
 def cost(cleaned_mask, poly):
+    # create a filled polygon to compare with the piece
     try:
         filled_poly = cv.fillPoly(np.zeros_like(cleaned_mask), [poly], 1)
+
+    # if something weird happens
     except:
         return None
 
+    # return the non matching area
     return np.sum(np.logical_xor(cleaned_mask, filled_poly))
 
 def contour_polygon(piece, piece_size):
     mask = piece.mask
     contour = piece.contour
+
+    # get the center of mass of the contour
     M = cv.moments(piece.contour)
     cx = int(M['m10'] / M['m00'])
     cy = int(M['m01'] / M['m00'])
@@ -136,11 +158,13 @@ def contour_polygon(piece, piece_size):
 
     zero_ids = find_pos_to_neg_zero_crossings(derivatives)
 
+    # create combos out of the convex max points on the contour
     combos = combos_of_four(zero_ids)
 
     if combos is None:
         return None
     
+    # close then open the mask to get rid of the plugs and sockets
     size = odd_size(np.sqrt(piece_size) * KERNEL_SIZE_PERCENT)
     kernel = np.ones((size,size),np.uint8)
     closed_mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
@@ -149,8 +173,9 @@ def contour_polygon(piece, piece_size):
     best_cost = float('inf')
     best_poly = None
     
+    # loops through each combo to find the one with the lowest cost
     for combo in combos:
-        poly = first_valid_quad(contour, combo)
+        poly = valid_quad(contour, combo)
         current_cost = cost(opened_mask, poly)
 
         if current_cost is not None and current_cost < best_cost:
@@ -159,6 +184,7 @@ def contour_polygon(piece, piece_size):
 
     return best_poly
 
+# for a given mask, find the centers of the individual contours (after eroding to separate them)
 def feature_points(mask, piece_size):
     size = odd_size(np.sqrt(piece_size) * KERNEL_SIZE_PERCENT_FEATURES)
     kernel = np.ones((size,size), np.uint8)
@@ -179,7 +205,9 @@ def feature_points(mask, piece_size):
     
     return points
 
+# find the normal of the closest edge to a point
 def closest_edge_normal(point, polygon):
+    # squeeze to git rid of the weird extra dimension opencv adds
     poly = np.squeeze(polygon)
     x0, y0 = point
 
@@ -190,23 +218,29 @@ def closest_edge_normal(point, polygon):
 
     N = len(poly)
 
+    # go through each pair of consecutive points to find the closest ones
     for i in range(N):
         p1 = poly[i]
+        # if it raps around, get that point
         p2 = poly[(i+1) % N]
+
 
         v = p2 - p1
         w = np.array([x0, y0]) - p1
         L = np.dot(v, v)
 
+        # project the input point onto the edge 
         t = np.clip(np.dot(w, v) / L, 0.0, 1.0)
         proj = p1 + t * v
 
+        # distance between input point and projection (it might be fine to just get the closest two points but whatever)
         dist = np.linalg.norm(proj - np.array([x0, y0]))
         if dist < min_dist:
             min_dist = dist
             best_proj = proj
             
             dx, dy = v
+            # get both normals (the polygon can be either clockwise or counterclockwise)
             n1 = np.array([-dy, dx])
             n2 = np.array([dy, -dx])
 
@@ -219,9 +253,11 @@ def closest_edge_normal(point, polygon):
 
     n1, n2 = best_normal
     proj = best_proj
-
+    
+    
     vec_to_point = np.array([x0, y0]) - proj
 
+    # ge the normal that points closest in direction to the input point (sockets point in, plugs point out)
     dot1 = np.dot(vec_to_point, n1)
     dot2 = np.dot(vec_to_point, n2)
 
@@ -229,7 +265,7 @@ def closest_edge_normal(point, polygon):
 
     return chosen, best_edge
 
-
+# find the plugs and sockets and add them to the piece objects
 def add_sockets_and_plugs(piece, piece_size):
     mask = piece.mask
     poly = piece.poly
@@ -237,16 +273,19 @@ def add_sockets_and_plugs(piece, piece_size):
     filled_poly = np.zeros_like(mask)
     cv.fillPoly(filled_poly, [poly], 1)
 
+    # in the diff between the polygon and the mask, the plugs will be positive and the sockets will be negative
     diff = mask.astype(np.int8) - filled_poly.astype(np.int8)
     plugs = diff > 0
     sockets = diff < 0
 
+    # get the points for each plug and socket
     plug_points = feature_points(plugs, piece_size)
     socket_points = feature_points(sockets, piece_size)
 
     piece.plugs = []
     piece.sockets = []
 
+    # add the plugs sockets and their normals
     for plug in plug_points:
         normal, edge = closest_edge_normal(plug, piece.poly)
         piece.plugs.append([list(plug), list(normal), list(edge)])
@@ -254,7 +293,8 @@ def add_sockets_and_plugs(piece, piece_size):
     for socket in socket_points:
         normal, edge = closest_edge_normal(socket, piece.poly)
         piece.sockets.append([list(socket), list(normal), list(edge)])
-    
+
+# displays the polygon and feature points on the piece image
 def display_features(piece):
     img = piece.image
     cv.polylines(img, [piece.poly], True, (0, 255, 0), 2)
@@ -269,6 +309,7 @@ def display_features(piece):
     plt.imshow(img)
     plt.show()
 
+# pickles the pieces after each step for debugging. Run "run_pipeline" for the full pipeline
 if __name__ == "__main__":
     with open('puzzle_mask.pkl', 'rb') as f:
         mask, piece_size = pickle.load(f)

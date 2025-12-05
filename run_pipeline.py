@@ -1,4 +1,4 @@
-from piece_registration import get_piece_mask, sepparate_contours
+from piece_registration import get_piece_mask, separate_contours
 from feature_detection import contour_polygon, add_sockets_and_plugs, display_features
 from filter_matches import generate_matches, display_match
 from rank_matches import cost, sort_sockets
@@ -12,41 +12,50 @@ from functools import partial
 
 DISPLAY = True
 
+# get input image
 image = Image.open('100_piece_puzzle.jpg').convert("RGB")
 width, height = image.size
 image = np.array(image)
 
+# get the puzzle piece mask and median piece size
 mask, piece_size = get_piece_mask(image, width, height)
 
-piece_list = sepparate_contours(image, height, width, mask, piece_size)
+# find and separate all the contours in the mask
+piece_list = separate_contours(image, height, width, mask, piece_size)
 print("number of pieces: ", len(piece_list))
 
 if DISPLAY:
+    # display the first piece's mask, image, and outpainted image
     piece_list[0].display()
 
+# fit polygons to each piece
 for piece in tqdm(piece_list, desc="fitting polygons"):
     piece.poly = contour_polygon(piece, piece_size)
 
+# find the plugs and sockets for each piece
 for piece in piece_list:
     add_sockets_and_plugs(piece, piece_size)
 
 if DISPLAY:
+    # display the first piece's polygon and plugs/sockets
     display_features(piece_list[0])
 
+# filter matches
 num_matches = generate_matches(piece_list, piece_size)
 
+# sort every sockets matches by their score
 pbar = tqdm(total=num_matches, desc="sorting matches")
 socket_list = []
 for piece in piece_list:
     for socket in piece.sockets:
         socket_list.append(socket)
+        # using partial to pass in the piece size and pbar to the cost function
         socket[-1].sort(key=partial(cost, piece_size=piece_size, pbar=pbar))
 
+# sort the sockets by their best matches score
 socket_list.sort(key=sort_sockets)
 
-image = Image.open('100_piece_puzzle.jpg').convert("RGB")
-image = np.array(image)
-
+# for each match display an arrow showing the connection and the composite image between the two pieces
 for socket in socket_list:
     match = socket[-1][0]
     arrow_image = cv.arrowedLine(image.copy(), np.array([match.plug_piece.x, match.plug_piece.y]) + np.array(match.plug[0]), np.array([match.socket_piece.x, match.socket_piece.y]) + np.array(match.socket[0]), (0, 255, 0), 10, tipLength=0.1)
